@@ -51,6 +51,7 @@
 #include <linux/inet.h>
 #include <linux/route.h>
 #include <linux/slab.h>
+#include <linux/version.h>
 #include <net/sock.h>
 #include <linux/fcntl.h>
 #include <linux/mm.h>
@@ -107,7 +108,11 @@ try_again:
         dn_sk_ports_copy(&fld, scp);
         fld.flowidn_proto = DNPROTO_NSP;
         if (dn_route_output_sock(&sk->sk_dst_cache, &fld, sk, 0) == 0) {
-                dst = sk->sk_dst_cache;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,0,0)
+        	dst = rcu_dereference_check(sk->sk_dst_cache, 1);
+#else
+        	dst = rcu_dereference_protected(sk->sk_dst_cache, 1);
+#endif
                 sk->sk_route_caps = dst->dev->features;
                 goto try_again;
         }
@@ -153,8 +158,10 @@ struct sk_buff *dn_alloc_skb(struct sock *sk, int size, gfp_t pri)
 unsigned long dn_nsp_persist(struct sock *sk)
 {
         struct dn_scp *scp = DN_SK(sk);
-
         unsigned long t = ((scp->nsp_srtt >> 2) + scp->nsp_rttvar) >> 1;
+
+	if (scp->state != DN_RUN)
+		return 2*HZ;
 
         t *= nsp_backoff[scp->nsp_rxtshift];
 
@@ -387,11 +394,16 @@ void dn_nsp_queue_xmit(struct sock *sk, struct sk_buff *skb,
 
         if (oth)
                 skb_queue_tail(&scp->other_xmit_queue, skb);
-        else
+        else {
                 skb_queue_tail(&scp->data_xmit_queue, skb);
 
-        if (scp->flowrem_sw != DN_SEND)
-                return;
+		/*
+		 * SEND/DONTSEND flow control only applies to the data
+		 * channel.
+	 	 */
+        	if (scp->flowrem_sw != DN_SEND)
+                	return;
+	}
 
         dn_nsp_clone_and_send(skb, gfp);
 }
@@ -511,13 +523,22 @@ void dn_send_conn_ack (struct sock *sk)
         dn_nsp_send(skb);
 }
 
-static int dn_nsp_retrans_conn_conf(struct sock *sk)
+int dn_nsp_retrans_conn_conf(struct sock *sk)
 {
         struct dn_scp *scp = DN_SK(sk);
 
-        if (scp->state == DN_CC)
-                dn_send_conn_conf(sk, GFP_ATOMIC);
-
+	if (scp->state == DN_CC) {
+		if (scp->persist_count-- != 0) {
+			dn_send_conn_conf(sk, GFP_ATOMIC);
+			scp->persist = NSP_CC_DELAY;
+			return 0;
+		}
+		sk->sk_err = EHOSTUNREACH;
+		scp->state = DN_NC;
+		sk->sk_state = TCP_CLOSE;
+		if (!sock_flag(sk, SOCK_DEAD))
+			sk->sk_state_change(sk);
+	}
         return 0;
 }
 
@@ -546,9 +567,6 @@ void dn_send_conn_conf(struct sock *sk, gfp_t gfp)
 
 
         dn_nsp_send(skb);
-
-        scp->persist = dn_nsp_persist(sk);
-        scp->persist_fxn = dn_nsp_retrans_conn_conf;
 }
 
 
@@ -646,12 +664,23 @@ void dn_nsp_send_link(struct sock *sk, unsigned char lsflags, char fcval)
         scp->persist_fxn = dn_nsp_xmit_timeout;
 }
 
-static int dn_nsp_retrans_conninit(struct sock *sk)
+int dn_nsp_retrans_conninit(struct sock *sk)
 {
         struct dn_scp *scp = DN_SK(sk);
 
-        if (scp->state == DN_CI)
-                dn_nsp_send_conninit(sk, NSP_RCI);
+	if (scp->state == DN_CI) {
+		if (scp->persist_count-- != 0) {
+			dn_nsp_send_conninit(sk, NSP_RCI);
+			scp->persist = NSP_CI_DELAY;
+			return 0;
+		}
+		scp->persist = 0;
+		sk->sk_err = EHOSTUNREACH;
+		scp->state = DN_NC;
+		sk->sk_state = TCP_CLOSE;
+		if (!sock_flag(sk, SOCK_DEAD))
+			sk->sk_state_change(sk);
+	}
 
         return 0;
 }
@@ -724,9 +753,6 @@ void dn_nsp_send_conninit(struct sock *sk, unsigned char msgflg)
         skb_put_u8(skb, aux);
         if (aux > 0)
                 skb_put_data(skb, scp->conndata_out.opt_data, aux);
-
-        scp->persist = dn_nsp_persist(sk);
-        scp->persist_fxn = dn_nsp_retrans_conninit;
 
         cb->rt_flags = DN_RT_F_RQR;
 

@@ -127,10 +127,12 @@ struct dn_scp                                   /* Session Control Port */
          */
         unsigned long stamp;          /* time of last transmit */
         unsigned long persist;
+	unsigned long persist_count;
         int (*persist_fxn)(struct sock *sk);
         unsigned long keepalive;
         void (*keepalive_fxn)(struct sock *sk);
         unsigned long ackdelay;
+	unsigned long conntimer;
 };
 
 static inline struct dn_scp *DN_SK(struct sock *sk)
@@ -211,6 +213,8 @@ void dn_unregister_sysctl(void);
 #define DN_MENUVER_PRX 0x04
 #define DN_MENUVER_UIC 0x08
 
+int dn_check_duplicate_conn(struct dn_skb_cb *cb);
+struct sock *dn_check_returned_conn(struct sk_buff *skb);
 struct sock *dn_sklist_find_listener(struct sockaddr_dn *addr);
 struct sock *dn_find_by_skb(struct sk_buff *skb);
 #define DN_ASCBUF_LEN 9
@@ -232,6 +236,7 @@ extern int decnet_di_count;
 extern int decnet_dr_count;
 extern int decnet_no_fc_max_cwnd;
 extern int decnet_dlyack_seq;
+extern int decnet_outgoing_timer;
 
 extern long sysctl_decnet_mem[3];
 extern int sysctl_decnet_wmem[3];
@@ -242,4 +247,13 @@ extern int sysctl_decnet_rmem[3];
 #define DN_DBG_RX_PACKET        4       /* Log received data packet */
 #define DN_DBG_TX_PACKET        16      /* Log transmitted data packet */
 
+extern int dn_nsp_retrans_conn_conf(struct sock *sk);
+extern int dn_nsp_retrans_conninit(struct sock *sk);
+
+/*
+ * Backwards compatibility for compilers earlier than GCC7
+ */
+#ifndef fallthrough
+#define fallthrough		do {} while (0)		/* fallthrough */
+#endif
 #endif /* _NET_DN_H */

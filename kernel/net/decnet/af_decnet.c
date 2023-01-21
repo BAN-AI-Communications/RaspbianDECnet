@@ -418,6 +418,53 @@ struct sock *dn_sklist_find_listener(struct sockaddr_dn *addr)
         return sk;
 }
 
+int dn_check_duplicate_conn(struct dn_skb_cb *cb)
+{
+	struct sock *sk;
+	struct dn_scp *scp;
+	int i, found = 0;
+
+	read_lock(&dn_hash_lock);
+	for (i = 0; i < DN_SK_HASH_SIZE; i++) {
+		sk_for_each(sk, &dn_sk_hash[i]) {
+			if (sk->sk_state != TCP_LISTEN) {
+				scp = DN_SK(sk);
+				if (cb->src != dn_saddr2dn(&scp->peer))
+					continue;
+				if (cb->src_port != scp->addrrem)
+					continue;
+
+				found = 1;
+				goto done;
+			}
+		}
+	}
+done:
+	read_unlock(&dn_hash_lock);
+	return found;
+}
+
+struct sock *dn_check_returned_conn(struct sk_buff *skb)
+{
+	struct dn_skb_cb *cb = DN_SKB_CB(skb);
+	struct sock *sk;
+	struct dn_scp *scp;
+
+	read_lock(&dn_hash_lock);
+	sk_for_each(sk, &dn_sk_hash[le16_to_cpu(cb->src_port) & DN_SK_HASH_MASK]) {
+		if (sk->sk_state != TCP_LISTEN) {
+			scp = DN_SK(sk);
+			if (cb->src_port != scp->addrloc)
+				continue;
+			sock_hold(sk);
+			read_unlock(&dn_hash_lock);
+			return sk;
+		}
+	}
+	read_unlock(&dn_hash_lock);
+	return NULL;
+}
+
 struct sock *dn_find_by_skb(struct sk_buff *skb)
 {
         struct dn_skb_cb *cb = DN_SKB_CB(skb);
@@ -501,7 +548,7 @@ static struct sock *dn_alloc_sock(struct net *net, struct socket *sock, gfp_t gf
         sk->sk_allocation  = gfp;
         sk->sk_sndbuf      = sysctl_decnet_wmem[1];
         sk->sk_rcvbuf      = sysctl_decnet_rmem[1];
-        sk->sk_dst_cache   = NULL;
+        sk->sk_dst_cache   = RCU_INITIALIZER(NULL);
         
         /* Initialization of DECnet Session Control Port                */
         scp = DN_SK(sk);
@@ -528,8 +575,14 @@ static struct sock *dn_alloc_sock(struct net *net, struct socket *sock, gfp_t gf
         scp->accept_mode = ACC_IMMED;
         scp->addr.sdn_family    = AF_DECnet;
         scp->peer.sdn_family    = AF_DECnet;
+	scp->conndata_in.opt_optl = 0;
+	scp->conndata_out.opt_optl = 0;
+	scp->discdata_in.opt_optl = 0;
+	scp->discdata_out.opt_optl = 0;
         scp->accessdata.acc_accl = 5;
         memcpy(scp->accessdata.acc_acc, "LINUX", 5);
+	scp->accessdata.acc_passl = 0;
+	scp->accessdata.acc_userl = 0;
 
         scp->max_window   = NSP_MAX_WINDOW;
         scp->snd_window   = NSP_MIN_WINDOW;
@@ -544,10 +597,12 @@ static struct sock *dn_alloc_sock(struct net *net, struct socket *sock, gfp_t gf
         skb_queue_head_init(&scp->other_receive_queue);
 
         scp->persist = 0;
+	scp->persist_count = 0;
         scp->persist_fxn = NULL;
         scp->keepalive = 10 * HZ;
         scp->keepalive_fxn = dn_keepalive;
         scp->ackdelay = 0;
+	scp->conntimer = 0;
 
         dn_start_slow_timer(sk);
 out:
@@ -643,12 +698,14 @@ static void dn_destroy_sock(struct sock *sk)
                 goto disc_reject;
         case DN_RUN:
                 scp->state = DN_DI;
-                __attribute__((__fallthrough__));
+		fallthrough;
+
         case DN_DI:
         case DN_DR:
 disc_reject:
                 dn_nsp_send_disc(sk, NSP_DISCINIT, 0, sk->sk_allocation);
-                __attribute__((__fallthrough__));
+		fallthrough;
+
         case DN_NC:
         case DN_NR:
         case DN_RJ:
@@ -662,7 +719,8 @@ disc_reject:
                 break;
         default:
                 printk(KERN_DEBUG "DECnet: dn_destroy_sock passed socket in invalid state\n");
-                __attribute__((__fallthrough__));
+		fallthrough;
+
         case DN_O:
                 dn_stop_slow_timer(sk);
 
@@ -846,6 +904,10 @@ static int dn_confirm_accept(struct sock *sk, long *timeo, gfp_t allocation)
         scp->segsize_loc = dst_metric_advmss(__sk_dst_get(sk));
         dn_send_conn_conf(sk, allocation);
 
+        scp->persist = NSP_CC_DELAY;
+	scp->persist_count = NSP_CC_RETRANS;
+        scp->persist_fxn = dn_nsp_retrans_conn_conf;
+
         prepare_to_wait(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE);
         for(;;) {
                 release_sock(sk);
@@ -996,6 +1058,11 @@ static int __dn_connect(struct sock *sk, struct sockaddr_dn *addr, int addrlen, 
         scp->segsize_loc = dst_metric_advmss(dst);
 
         dn_nsp_send_conninit(sk, NSP_CI);
+
+        scp->persist = NSP_CI_DELAY;
+	scp->persist_count = NSP_CI_RETRANS;
+        scp->persist_fxn = dn_nsp_retrans_conninit;
+
         err = -EINPROGRESS;
         if (*timeo) {
                 err = dn_wait_run(sk, timeo);
@@ -1121,6 +1188,7 @@ static int dn_accept(struct socket *sock, struct socket *newsock, int flags,
                 return -EINVAL;
         }
 
+try_again:
         skb = skb_dequeue(&sk->sk_receive_queue);
         if (skb == NULL) {
                 skb = dn_wait_for_connect(sk, &timeo);
@@ -1132,6 +1200,18 @@ static int dn_accept(struct socket *sock, struct socket *newsock, int flags,
 
         cb = DN_SKB_CB(skb);
         sk_acceptq_removed(sk);
+
+	/*
+	 * Now we can check to see if this is a duplicate Connect-Initiate
+	 * and there is already a socket set up for this logical link.
+	 */
+	if ((cb->nsp_flags & 0x78) == NSP_RCI) {
+		if (dn_check_duplicate_conn(cb)) {
+			kfree_skb(skb);
+			goto try_again;
+		}
+	}
+
         newsk = dn_alloc_sock(sock_net(sk), newsock, sk->sk_allocation, kern);
         if (newsk == NULL) {
                 release_sock(sk);
@@ -1141,7 +1221,7 @@ static int dn_accept(struct socket *sock, struct socket *newsock, int flags,
         release_sock(sk);
 
         dst = skb_dst(skb);
-        sk_dst_set(newsk, dst);
+        __sk_dst_set(newsk, dst);
         skb_dst_set(skb, NULL);
 
         DN_SK(newsk)->state        = DN_CR;
@@ -1883,7 +1963,7 @@ out:
 static inline int dn_queue_too_long(struct dn_scp *scp, struct sk_buff_head *queue, int flags)
 {
         if (flags & MSG_OOB) {
-                if (scp->flowrem_oth == 0)
+                if ((scp->flowrem_oth == 0) || !skb_queue_empty(queue))
                         return 1;
         } else {
                 if (skb_queue_len(queue) >= scp->snd_window)
@@ -2018,7 +2098,12 @@ static int dn_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
                 goto out_err;
         }
 
-        if ((flags & MSG_TRYHARD) && sk->sk_dst_cache)
+	if ((flags & MSG_TRYHARD) &&
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,0,0)
+        	rcu_dereference_check(sk->sk_dst_cache, 1))
+#else
+        	rcu_dereference_protected(sk->sk_dst_cache, 1))
+#endif
                 dst_negative_advice(sk);
 
         mss = scp->segsize_rem;

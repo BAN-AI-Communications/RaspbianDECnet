@@ -59,6 +59,7 @@
 #include <linux/inet.h>
 #include <linux/route.h>
 #include <linux/slab.h>
+#include <linux/version.h>
 #include <net/sock.h>
 #include <net/tcp_states.h>
 #include <linux/fcntl.h>
@@ -155,20 +156,20 @@ static int dn_process_ack(struct sock *sk, struct sk_buff *skb, int oth)
                                 ack ^= 0x2000;
                         dn_ack(sk, skb, ack);
                 }
-        }
 
-        if (skb->len < 2)
-                return len;
+        	if (skb->len < 2)
+                	return len;
 
-        if ((ack = le16_to_cpu(*ptr)) & 0x8000) {
-                skb_pull(skb, 2);
-                len += 2;
-                if ((ack & 0x4000) == 0) {
-                        if (oth)
-                                ack ^= 0x2000;
-                        dn_ack(sk, skb, ack);
-                }
-        }
+        	if ((ack = le16_to_cpu(*ptr)) & 0x8000) {
+                	skb_pull(skb, 2);
+                	len += 2;
+                	if ((ack & 0x4000) == 0) {
+                        	if (oth)
+                                	ack ^= 0x2000;
+                        	dn_ack(sk, skb, ack);
+                	}
+        	}
+	}
 
         return len;
 }
@@ -232,6 +233,7 @@ static struct sock *dn_find_listener(struct sk_buff *skb, unsigned short *reason
         struct nsp_conn_init_msg *msg = (struct nsp_conn_init_msg *)skb->data;
         struct sockaddr_dn dstaddr;
         struct sockaddr_dn srcaddr;
+	struct sock *sk;
         unsigned char type = 0;
         int dstlen;
         int srclen;
@@ -309,7 +311,7 @@ static struct sock *dn_find_listener(struct sk_buff *skb, unsigned short *reason
                         goto err_out;
                 if (dn_check_idf(&ptr, &len, 39, 1))
                         goto err_out;
-                if (dn_check_idf(&ptr, &len, 39, (menuver & DN_MENUVER_USR) ? 1 : 0))
+                if (dn_check_idf(&ptr, &len, 39, 1))
                         goto err_out;
         }
 
@@ -362,6 +364,7 @@ static void dn_nsp_conn_conf(struct sock *sk, struct sk_buff *skb)
 
         if ((scp->state == DN_CI) || (scp->state == DN_CD)) {
                 scp->persist = 0;
+		scp->conntimer = 0;
                 scp->addrrem = cb->src_port;
                 sk->sk_state = TCP_ESTABLISHED;
                 scp->state = DN_RUN;
@@ -407,6 +410,7 @@ static void dn_nsp_conn_ack(struct sock *sk, struct sk_buff *skb)
         if (scp->state == DN_CI) {
                 scp->state = DN_CD;
                 scp->persist = 0;
+		scp->conntimer = decnet_outgoing_timer * HZ;
         }
 
         kfree_skb(skb);
@@ -444,6 +448,7 @@ static void dn_nsp_disc_init(struct sock *sk, struct sk_buff *skb)
         case DN_CD:
                 scp->state = DN_RJ;
                 sk->sk_err = ECONNREFUSED;
+		scp->conntimer = 0;
                 break;
         case DN_RUN:
                 sk->sk_shutdown |= SHUTDOWN_MASK;
@@ -507,7 +512,8 @@ static void dn_nsp_disc_conf(struct sock *sk, struct sk_buff *skb)
                 break;
         case DN_RUN:
                 sk->sk_shutdown |= SHUTDOWN_MASK;
-                __attribute__((__fallthrough__));
+		fallthrough;
+
         case DN_CC:
                 scp->state = DN_CN;
         }
@@ -594,37 +600,6 @@ out:
         kfree_skb(skb);
 }
 
-/*
- * Copy of sock_queue_rcv_skb (from sock.h) without
- * bh_lock_sock() (its already held when this is called) which
- * also allows data and other data to be queued to a socket.
- */
-static __inline__ int dn_queue_skb(struct sock *sk, struct sk_buff *skb, int sig, struct sk_buff_head *queue)
-{
-        int err;
-
-        /* Cast skb->rcvbuf to unsigned... It's pointless, but reduces
-           number of warnings when compiling with -W --ANK
-         */
-        if (atomic_read(&sk->sk_rmem_alloc) + skb->truesize >=
-            (unsigned int)sk->sk_rcvbuf) {
-                err = -ENOMEM;
-                goto out;
-        }
-
-        err = sk_filter(sk, skb);
-        if (err)
-                goto out;
-
-        skb_set_owner_r(skb, sk);
-        skb_queue_tail(queue, skb);
-
-        if (!sock_flag(sk, SOCK_DEAD))
-                sk->sk_data_ready(sk);
-out:
-        return err;
-}
-
 static void dn_nsp_otherdata(struct sock *sk, struct sk_buff *skb)
 {
         struct dn_scp *scp = DN_SK(sk);
@@ -639,12 +614,13 @@ static void dn_nsp_otherdata(struct sock *sk, struct sk_buff *skb)
         skb_pull(skb, 2);
 
         if (seq_next(scp->numoth_rcv, segnum)) {
-
-                if (dn_queue_skb(sk, skb, SIGURG, &scp->other_receive_queue) == 0) {
+		rcu_read_lock();
+		if (sock_queue_rcv_skb(sk, skb) == 0) {
                         seq_add(&scp->numoth_rcv, 1);
                         scp->other_report = 0;
                         queued = 1;
                 }
+		rcu_read_unlock();
         }
 
         dn_nsp_send_oth_ack(sk);
@@ -667,10 +643,12 @@ static void dn_nsp_data(struct sock *sk, struct sk_buff *skb)
         skb_pull(skb, 2);
 
         if (seq_next(scp->numdat_rcv, segnum)) {
-                if (dn_queue_skb(sk, skb, SIGIO, &sk->sk_receive_queue) == 0) {
+		rcu_read_lock();
+		if (sock_queue_rcv_skb(sk, skb) == 0) {
                         seq_add(&scp->numdat_rcv, 1);
                         queued = 1;
                 }
+		rcu_read_unlock();
 
                 if ((scp->flowloc_sw == DN_SEND) && dn_congested(sk)) {
                         scp->flowloc_sw = DN_DONTSEND;
@@ -694,18 +672,17 @@ out:
  * deals with it. It puts the socket into the NO_COMMUNICATION
  * state.
  */
-static void dn_returned_conn_init(struct sock *sk, struct sk_buff *skb)
+static void dn_returned_conn_init(struct sock *sk)
 {
         struct dn_scp *scp = DN_SK(sk);
 
         if (scp->state == DN_CI) {
                 scp->state = DN_NC;
                 sk->sk_state = TCP_CLOSE;
+		sk->sk_err = EHOSTUNREACH;
                 if (!sock_flag(sk, SOCK_DEAD))
                         sk->sk_state_change(sk);
         }
-
-        kfree_skb(skb);
 }
 
 static int dn_nsp_no_socket(struct sk_buff *skb, unsigned short reason)
@@ -767,12 +744,30 @@ static int dn_nsp_rx_packet(struct net *net, struct sock *sk2,
                         goto free_out;
                 case 0x10:
                 case 0x60:
-                        if (unlikely(cb->rt_flags & DN_RT_F_RTS))
-                                goto free_out;
+			if (cb->rt_flags & DN_RT_F_RTS) {
+				if (pskb_may_pull(skb, 4)) {
+					cb->dst_port = *(__le16 *)ptr;
+					ptr += 2;
+					cb->src_port = *(__le16 *)ptr;
+					if ((sk = dn_check_returned_conn(skb)) != NULL) {
+						dn_returned_conn_init(sk);
+						sock_put(sk);
+					}
+				}
+				kfree_skb(skb);
+				return NET_RX_SUCCESS;
+			}
                         sk = dn_find_listener(skb, &reason);
                         goto got_it;
                 }
         }
+
+	/*
+	 * We've already handled all packet types which can be returned
+	 * to sender (CI and retransmitted CI). Discard all other packet types.
+	 */
+        if (unlikely(cb->rt_flags & DN_RT_F_RTS))
+		goto free_out;
 
         if (!pskb_may_pull(skb, 3))
                 goto free_out;
@@ -794,15 +789,6 @@ static int dn_nsp_rx_packet(struct net *net, struct sock *sk2,
         }
 
         /*
-         * Returned packets...
-         * Swap src & dst and look up in the normal way.
-         */
-        if (unlikely(cb->rt_flags & DN_RT_F_RTS)) {
-                swap(cb->dst_port, cb->src_port);
-                swap(cb->dst, cb->src);
-        }
-
-        /*
          * Find the socket to which this skb is destined.
          */
         sk = dn_find_by_skb(skb);
@@ -810,7 +796,11 @@ got_it:
         if (sk != NULL) {
                 struct dn_scp *scp = DN_SK(sk);
 
-                if (skb_dst(skb) != sk->sk_dst_cache) {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,0,0)
+        	if (skb_dst(skb) != rcu_dereference_check(sk->sk_dst_cache, 1)) {
+#else
+        	if (skb_dst(skb) != rcu_dereference_protected(sk->sk_dst_cache, 1)) {
+#endif
                         /*
                          * We may have a newer path to the remote system
                          * which takes the Intra-Ethernet bit into
@@ -819,7 +809,7 @@ got_it:
                          * to avoid messing with sockets which are listening.
                          */
                         if (scp->state == DN_RUN)
-                                sk_dst_set(sk, dst_clone(skb_dst(skb)));
+                                __sk_dst_set(sk, dst_clone(skb_dst(skb)));
                 }
 
                 /* Reset backoff */
@@ -861,10 +851,7 @@ int dn_nsp_backlog_rcv(struct sock *sk, struct sk_buff *skb)
         struct dn_skb_cb *cb = DN_SKB_CB(skb);
 
         if (cb->rt_flags & DN_RT_F_RTS) {
-                if (cb->nsp_flags == 0x18 || cb->nsp_flags == 0x68)
-                        dn_returned_conn_init(sk, skb);
-                else
-                        kfree_skb(skb);
+                kfree_skb(skb);
                 return NET_RX_SUCCESS;
         }
 
